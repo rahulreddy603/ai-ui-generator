@@ -9,39 +9,47 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// In-memory storage for UI versions
 const uiVersions = new Map();
 
-// --- Agent Prompts (Constants) ---
-const PLANNER_PROMPT = `You are a UI Planner. Analyze the user's intent and create a structured plan.
+// --- AGENT PROMPTS (Isolated & Specific) ---
+
+const PLANNER_PROMPT = `You are a UI Planner. Your job is to analyze intent and create a structural blueprint.
 AVAILABLE COMPONENTS: Button, Card, Input, Table, Modal, Sidebar, Navbar, Chart.
-RULES: 
-1. Only use listed components. 
-2. Output JSON: { "layout": "", "components": [], "reasoning": "" }.
+
+RULES:
+1. Only use the components listed above.
+2. Output a JSON object with: layout (grid/flex/sidebar), components (type, props, content), and reasoning.
+3. Do not write any code.
+
 User request: {USER_REQUEST}`;
 
-const GENERATOR_PROMPT = `You are a UI Code Generator.
+const GENERATOR_PROMPT = `You are a UI Code Generator. Convert the following plan into a valid React component.
+PLAN: {PLAN}
+
 RULES:
 1. Use ONLY: import { Button, Card, Input, Table, Modal, Sidebar, Navbar, Chart } from './UI'
-2. Export a functional component called GeneratedUI.
-3. No inline styles, no custom CSS.
-Plan: {PLAN}`;
+2. Create a functional component named 'GeneratedUI'.
+3. NO inline styles, NO className, NO Tailwind.
+4. Return ONLY the code inside markdown blocks.`;
 
-const MODIFIER_PROMPT = `You are a UI Modifier. 
-Modify the code based on: {USER_REQUEST}
+const MODIFIER_PROMPT = `You are a UI Modifier. Incremental changes are preferred over full rewrites.
 Current code: {CURRENT_CODE}
-Output JSON: { "modifiedCode": "...", "changes": "..." }`;
+Modification request: {USER_REQUEST}
 
-// --- Helper Functions ---
-async function callClaude(prompt, systemPrompt = '') {
+RULES:
+1. Preserve existing component logic where possible.
+2. Output JSON: { "modifiedCode": "...", "changes": "description of what changed" }.`;
+
+// --- HELPER FUNCTIONS ---
+
+async function callClaude(prompt) {
     try {
         const response = await axios.post(
             'https://api.anthropic.com/v1/messages',
             {
-                model: 'claude-3-5-sonnet-20240620', // Updated to current stable version
+                model: 'claude-3-5-sonnet-20240620',
                 max_tokens: 4000,
-                messages: [{ role: 'user', content: prompt }],
-                system: systemPrompt
+                messages: [{ role: 'user', content: prompt }]
             },
             {
                 headers: {
@@ -53,55 +61,59 @@ async function callClaude(prompt, systemPrompt = '') {
         );
         return response.data.content[0].text;
     } catch (error) {
-        throw new Error(`Claude API Error: ${error.response?.data?.error?.message || error.message}`);
+        // Log the actual error for Render monitoring
+        console.error("Claude API Error:", error.response?.data || error.message);
+        throw new Error(`AI Gateway Error: ${error.response?.data?.error?.message || error.message}`);
     }
 }
 
-function extractJSON(text) {
+function parseJSON(text) {
     const match = text.match(/\{[\s\S]*\}/);
-    if (!match) throw new Error('No valid JSON found in response');
+    if (!match) throw new Error('AI failed to return valid structural JSON.');
     return JSON.parse(match[0]);
 }
 
-function cleanCode(text) {
-    // Removes markdown code blocks if present
-    return text.replace(/```(?:jsx|javascript|tsx)?\n?([\s\S]*?)```/g, '$1').trim();
+function extractCode(text) {
+    const match = text.match(/```(?:jsx|javascript)?\n?([\s\S]*?)```/);
+    return match ? match[1].trim() : text.trim();
 }
 
-function validateComponents(code) {
+function validateUI(code) {
     const allowed = ['Button', 'Card', 'Input', 'Table', 'Modal', 'Sidebar', 'Navbar', 'Chart'];
     const componentRegex = /<([A-Z][a-zA-Z]*)/g;
     const matches = [...code.matchAll(componentRegex)];
 
     for (const match of matches) {
         if (!allowed.includes(match[1])) {
-            throw new Error(`Forbidden component: ${match[1]}`);
+            throw new Error(`Security Violation: Forbidden component <${match[1]}> detected.`);
         }
     }
-    if (code.includes('style=') || code.includes('className=')) {
-        throw new Error('Custom styling is strictly prohibited.');
+    if (/style=|className=/.test(code)) {
+        throw new Error('Design Violation: Manual styling is prohibited. Use component props only.');
     }
 }
 
-// --- API Endpoints ---
+// --- API ENDPOINTS ---
 
 app.post('/api/generate', async (req, res) => {
     try {
         const { userIntent, sessionId } = req.body;
-        if (!userIntent || !sessionId) return res.status(400).json({ error: 'Missing parameters' });
+        if (!userIntent) return res.status(400).json({ error: 'Intent is required' });
 
+        // Step 1: Planning
         const planText = await callClaude(PLANNER_PROMPT.replace('{USER_REQUEST}', userIntent));
-        const plan = extractJSON(planText);
+        const plan = parseJSON(planText);
 
-        const rawCode = await callClaude(GENERATOR_PROMPT.replace('{PLAN}', JSON.stringify(plan)));
-        const code = cleanCode(rawCode);
+        // Step 2: Generation
+        const codeText = await callClaude(GENERATOR_PROMPT.replace('{PLAN}', JSON.stringify(plan)));
+        const code = extractCode(codeText);
 
-        validateComponents(code);
+        validateUI(code);
 
         const version = {
             id: Date.now().toString(),
             code,
-            plan,
+            explanation: plan.reasoning,
             timestamp: new Date().toISOString()
         };
 
@@ -121,15 +133,15 @@ app.post('/api/modify', async (req, res) => {
         const responseText = await callClaude(
             MODIFIER_PROMPT.replace('{CURRENT_CODE}', currentCode).replace('{USER_REQUEST}', userRequest)
         );
-        const result = extractJSON(responseText);
-        const code = cleanCode(result.modifiedCode);
+        const result = parseJSON(responseText);
+        const code = extractCode(result.modifiedCode);
 
-        validateComponents(code);
+        validateUI(code);
 
         const version = {
             id: Date.now().toString(),
             code,
-            changes: result.changes,
+            explanation: result.changes,
             timestamp: new Date().toISOString()
         };
 
@@ -146,4 +158,5 @@ app.get('/api/versions/:sessionId', (req, res) => {
     res.json(uiVersions.get(req.params.sessionId) || []);
 });
 
-app.listen(PORT, () => console.log(`Backend active on port ${PORT}`));
+// Ensure the server listens on 0.0.0.0 for Render deployment
+app.listen(PORT, '0.0.0.0', () => console.log(`Backend active on port ${PORT}`));

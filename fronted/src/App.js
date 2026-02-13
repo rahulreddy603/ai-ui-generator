@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react'; // Added useCallback
 import axios from 'axios';
 import ChatPanel from './component/ChatPanel';
 import CodeEditor from './component/CodeEditor';
@@ -13,21 +13,21 @@ function App() {
   const [versions, setVersions] = useState([]);
   const [currentVersionId, setCurrentVersionId] = useState(null);
 
-  // Open App.js and replace the API_BASE line with this:
-const API_BASE = 'http://localhost:5000/api';
+  const API_BASE = 'https://ai-ui-generator-0o7n.onrender.com/api';
 
-  useEffect(() => {
-    fetchVersions();
-  }, []);
-
-  const fetchVersions = async () => {
+  // Wrapped in useCallback to satisfy dependency requirements
+  const fetchVersions = useCallback(async () => {
     try {
       const response = await axios.get(`${API_BASE}/versions/${sessionId}`);
       setVersions(response.data);
     } catch (error) {
       console.error('Error fetching versions:', error);
     }
-  };
+  }, [API_BASE, sessionId]); // Dependencies for the callback
+
+  useEffect(() => {
+    fetchVersions();
+  }, [fetchVersions]); // fetchVersions is now a stable dependency
 
   const handleGenerate = async (userIntent) => {
     setLoading(true);
